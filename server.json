@@ -1,0 +1,18 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "ai.plcs/plcs-ai",
+  "title": "PLCs.ai",
+  "description": "Query Allen-Bradley and Siemens PLC projects, live tag values, and analyses in plain English. 19 tools: read project source, search grounded context, run analyses (dead code, race conditions, interlock audits), generate reviewable code proposals, and export vendor files or PDF documentation.",
+  "version": "1.0.0",
+  "websiteUrl": "https://www.plcs.ai/developer/mcp",
+  "repository": {
+    "url": "https://github.com/PLCsai/plcs-ai-mcp",
+    "source": "github"
+  },
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://mcp.plcs.ai/mcp"
+    }
+  ]
+}
