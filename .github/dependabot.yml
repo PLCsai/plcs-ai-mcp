@@ -1,0 +1,17 @@
+version: 2
+
+# There is no npm ecosystem here — this repo holds a README and a registry
+# manifest, with no package.json and no lockfile. The only thing with pinned
+# versions is the CI workflows, which pin every action to a commit SHA; without
+# this those pins silently rot.
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
+    groups:
+      actions:
+        patterns: ['*']
+    commit-message:
+      prefix: 'build(ci)'

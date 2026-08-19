@@ -1,0 +1,553 @@
+name: AI Code Review
+
+# Advisory, semantic-only AI code review. Unlike the sibling repos, this one also
+# requires a human approval (the ruleset asks for 1), so this pass is a second
+# look rather than the only one. Findings never block merge (they never turn
+# `ai-review-results` red — see below) and it never posts an approving or
+# CHANGES_REQUESTED review, so it can never stand in for that human. SDLC policy
+# still applies to what it does post: every finding is reviewed, acted on, and
+# closed with a comment recording the outcome, enforced by the ruleset's
+# conversation-resolution rule. The check
+# DOES gate merge two ways, both by design: (1) an over-size diff turns it red
+# (failure) so a large PR can't slip through unreviewed by tripping the skip — the
+# author must split it into smaller PRs; (2) the repo ruleset requires conversation
+# resolution, so each inline finding it posts opens a review thread that must be
+# resolved (fixed or declined) before merge. A clean, normally-sized PR opens NO
+# thread — it posts only a top-level summary comment — so it isn't gated by this
+# check. The reviewer is read-only BY CONSTRUCTION: contents: read + an
+# --allowedTools allowlist limited to workspace-scoped repo reads (Grep/Glob/Read)
+# and comment posting — no Edit/Write/git-push and no network-egress tool. So even
+# though it reads the untrusted PR diff and may search the repo to verify cross-file
+# findings, a prompt-injection hijack has nowhere to escape to: worst case is a bad
+# comment, never a commit/push/exfil. The reads stay inside the checked-out tree (no
+# --add-dir, so /proc and out-of-tree paths are unreachable), which holds no secrets
+# (secret_scan enforces that) and is already visible to anyone with repo access;
+# subprocess env-scrub stays on (default).
+#
+# It runs claude[bot] via the Claude GitHub App (OIDC, hence id-token: write) so
+# use_sticky_comment can find and update its own prior comment across pushes.
+# Review instructions (where quality lives) live in .github/claude-review.md and
+# are injected into the prompt; tune that file, not this workflow, to manage
+# noise.
+#
+# THE VERDICT IS THIS JOB'S OWN CONCLUSION. `ai-review-results` is intended to be a
+# REQUIRED check on the main ruleset, and it is the single job below — GitHub reports
+# a job's result as a check run of the job's name, so the job passing/failing IS the
+# verdict. This is deliberate. A check run created via the REST API (`checks.create`)
+# is NOT parented to the run that made it: GitHub adopts it into the earliest
+# check-suite for the head SHA, and when that suite concluded skipped/cancelled (a
+# draft-gated or concurrency-superseded run) the required check stayed pinned to a
+# non-success suite and wedged the merge box BLOCKED even while reading green. A JOB
+# check run lives in its OWN run's suite, and the merge gate uses the most recent run
+# of the name, so that wedge cannot happen. Conclusion mapping (pure process-state,
+# NEVER gated on findings):
+#     success (green)  = a review ran, OR an intentional skip that carries nothing
+#                        to review (a Dependabot bump, this PR edits the review workflow, or the
+#                        reviewable diff is unchanged since the last
+#                        review). Findings never turn it red — false positives must
+#                        not block, and green stays the immutable "review ran" SOC 2
+#                        evidence even when inline comments exist.
+#     failure (red)    = the diff is too large to review well (split the PR — the ONE
+#                        skip that blocks, so an oversize diff can't bypass review),
+#                        the action errored, OR the PR is a DRAFT (fail-closed — see
+#                        below). Investigate the first two; a draft clears on ready.
+#     cancelled        = a job-level timeout or a concurrency supersede. A supersede
+#                        is harmless (its SHA is no longer head; the newer push gets
+#                        its own verdict); a timeout leaves the head SHA's required
+#                        check cancelled, which blocks until a re-run — self-healing,
+#                        never a silent green.
+# So EVERY outcome yields a job conclusion for free (the job always runs — there is
+# no job-level `if:` and no separate emit step to forget). DRAFTS fail RED rather than
+# skip: a *skipped* required check has version-dependent GitHub semantics (it can
+# count as passing), so a skipped draft check + a lost/racing ready_for_review event
+# could merge an unreviewed PR. Red on a draft is harmless (drafts can't merge) and
+# clears the instant the PR is flipped ready and re-reviewed.
+#
+# A non-required `ai-review-findings` COMMIT STATUS carries the reviewed diff's
+# hash (plus a short finding count, for humans) forward so the next push can debounce
+# a byte-identical re-review (see the Size guard). It is non-required, so its own
+# suite parentage never gates merge; if it is ever absent the debounce simply
+# degrades to reviewing again.
+#
+# Prereqs (one-time, outside this workflow file):
+#   * Install the Claude GitHub App on the org/repo (grants the claude[bot] OIDC
+#     identity so use_sticky_comment can post/update as itself).
+#   * Add the CODE_REVIEW_ANTHROPIC_API_KEY repo secret (a dedicated key so this
+#     reviewer's spend is isolable in the Anthropic console for cost tracking).
+#   * Add `ai-review-results` to the main ruleset's required_status_checks so the
+#     verdict actually gates merge.
+
+on:
+  pull_request:
+    # ready_for_review fires when a draft is marked ready — without it, a PR
+    # opened as a draft and later flipped never triggers a review (the draft's
+    # opened/synchronize runs are filtered by the draft guard below, and the
+    # flip itself emits only ready_for_review).
+    types: [opened, synchronize, reopened, ready_for_review]
+
+concurrency:
+  # A new push supersedes the in-flight review of the prior commit — we only
+  # ever want the latest diff reviewed, and it caps spend on rapid push loops.
+  group: claude-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read # NOT write — the reviewer must not be able to commit or push.
+  pull-requests: write # post inline + summary review comments
+  id-token: write # OIDC -> authenticate as claude[bot] (Claude GitHub App)
+  statuses: write # write the non-required `ai-review-findings` debounce carrier
+
+jobs:
+  ai-review-results:
+    name: ai-review-results
+    runs-on: ubuntu-latest
+    # Generous ceiling: a complete single-pass review (see .github/claude-review.md
+    # — report every blocker/high, no volume cap) writes many inline comments on a
+    # large buggy diff, and each is a tool round-trip. The ceiling is free (Actions
+    # bills only actual wall time; --max-turns 40 bounds token spend regardless),
+    # so the headroom only ever costs the PRs that genuinely need it.
+    timeout-minutes: 30
+    # The job ALWAYS runs (no job-level draft/dependabot `if:`). It IS the required
+    # `ai-review-results` check, so its conclusion must be unambiguous on every head.
+    # A draft PR fails the job RED (fail-closed — see the size guard), NOT skipped:
+    # GitHub's treatment of a *skipped* required check has varied across versions
+    # (it can count as passing), which would let a lost or racing ready_for_review
+    # event leave a draft's check GREEN and merge an unreviewed PR. We never depend on
+    # that — the job runs and concludes explicitly. Red on a draft is harmless (it
+    # can't merge) and clears the instant it's readied. Dependabot PRs likewise
+    # reach the size guard (skipReason 'dependabot') and finish green.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1 # the action reads the diff via the API / `gh pr diff`
+
+      - name: Size guard
+        id: size
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            // "Too large to review well" guard: skip the model call on enormous
+            // diffs. The count is additions-weighted (see the per-file cost model
+            // below): added content is what a reviewer must scrutinize line by
+            // line, so deletions count lightly and a whole-file removal not at all.
+            //
+            // 2000 is generous for a repo holding a README and a registry
+            // manifest. Anything approaching it is a rewrite that wants splitting.
+            const MAX_CHANGED_LINES = 2000;
+            const IGNORE = [
+              /(^|\/)package-lock\.json$/,
+            ];
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const pr = context.payload.pull_request;
+            // Fail-closed on drafts (see the job header): a draft can't merge, and
+            // ready_for_review re-runs this job the instant it's readied. We do NOT
+            // skip — a skipped required check has version-dependent GitHub semantics
+            // (may count as passing), which could let a lost/racing ready event leave
+            // a draft GREEN and merge unreviewed. Red is unambiguous and costs no
+            // model spend (returns before the review steps; `proceed` stays unset, so
+            // the gated steps below don't run).
+            if (pr.draft) {
+              core.setFailed('Draft PR — the AI review runs once the PR is marked ready for review.');
+              return;
+            }
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner, repo, pull_number: pr.number, per_page: 100,
+            });
+            let changed = 0;
+            const reviewable = [];
+            const patches = [];
+            for (const f of files) {
+              if (IGNORE.some((re) => re.test(f.filename))) continue;
+              reviewable.push(f.filename);
+              const removed = f.status === 'removed';
+              // Per-file cost model. Additions are new code the reviewer must
+              // read line-by-line — full weight. Deletions inside a modified
+              // file cost far less: the question is "is removing this safe?",
+              // answered by impact analysis (call sites), not per-line reading —
+              // so weight them at 0.25. A whole-file deletion is a SINGLE
+              // decision regardless of size, so it adds nothing to the count; it
+              // is still reviewed (stub below) for dangling references.
+              if (!removed) {
+                changed += (f.additions ?? 0) + Math.round((f.deletions ?? 0) * 0.25);
+              }
+              // listFiles already returns each file's unified-diff hunk; reusing
+              // it lets us hand the model a diff PRE-FILTERED to reviewable files
+              // so it never pages through the large raw `gh pr diff`.
+              // For a removed file the patch is the entire former body as `-`
+              // lines — dead content nobody reads line-by-line; hand the model a
+              // one-line stub that steers it to the only review that matters:
+              // grep for remaining references. `patch` is omitted for binary /
+              // very large files — flag those.
+              patches.push(
+                removed
+                  ? `### ${f.filename}\n[file deleted, ${f.deletions ?? 0} lines — verify no remaining references (imports, callers, registry entries)]`
+                  : f.patch
+                    ? `### ${f.filename}\n${f.patch}`
+                    : `### ${f.filename}\n[diff omitted (binary or very large) — fetch with: gh pr diff]`);
+            }
+            const fs = require('fs');
+            const crypto = require('crypto');
+            const diffBody = patches.length ? patches.join('\n\n') : '(no reviewable changes)';
+            // Fingerprint of the FILTERED diff — the actual unit we review, not
+            // the head sha (which moves on every push regardless of content).
+            const diffHash = crypto.createHash('sha256').update(diffBody).digest('hex');
+            core.setOutput('diff_hash', diffHash);
+            // Debounce: skip the model call when this filtered diff is byte-
+            // identical to the one already reviewed on the previous head.
+            // `synchronize` hands us the prior head sha in payload.before, and the
+            // fingerprint we reviewed it under is carried on that commit's
+            // non-required `ai-review-findings` commit status (written below). A
+            // push that touched only ignored paths (lockfile, public assets) or a no-op
+            // history rewrite (amend, no-op rebase, squash) moves the sha but not
+            // the reviewable content, so a re-review buys nothing and only
+            // re-litigates settled findings. Degrades to "review" whenever the prior
+            // fingerprint is absent (first review, force-push onto a dropped commit,
+            // a prior run that errored or was superseded) — it can only ever suppress
+            // a true no-op, never a real change.
+            let unchanged = false;
+            const before = context.payload.before;
+            if (before && /^[0-9a-f]{40}$/.test(before) && before !== pr.head.sha) {
+              try {
+                const statuses = (await github.rest.repos.getCombinedStatusForRef({
+                  owner, repo, ref: before, per_page: 100,
+                })).data.statuses;
+                const fp = statuses.find((s) => s.context === 'ai-review-findings');
+                const m = fp ? /fp:([0-9a-f]{64})/.exec(fp.description || '') : null;
+                if (m && m[1] === diffHash) {
+                  unchanged = true;
+                }
+              } catch (e) {
+                core.info(`debounce lookup failed (will review): ${e.message}`);
+              }
+            }
+            const tooLarge = changed > MAX_CHANGED_LINES;
+            // The action refuses to run when THIS workflow file differs from the
+            // version on the default branch (its guard against a PR rewriting the
+            // reviewer to exfiltrate the key). So a PR that edits this file can't
+            // be reviewed — pre-empt the action's raw "workflow validation failed"
+            // annotation by concluding the job green (nothing to review), rather than
+            // letting the action error into a misleading red; it reviews normally
+            // once merged.
+            const modifiesSelf = files.some((f) => f.filename === '.github/workflows/claude-review.yml');
+            // Dependabot PRs only bump manifests/lockfiles — nothing semantic to
+            // review (lockfiles are excluded from scope anyway). We let the job reach
+            // this guard (rather than excluding it at the job `if`) so it concludes
+            // green rather than being skipped. self_workflow keeps precedence (a
+            // Dependabot actions-bump edits this file) — both resolve to green.
+            //
+            // BUT skip only when EVERY commit is Dependabot's own. `pr.user` is
+            // who OPENED the PR and never changes, so a human commit pushed onto a
+            // Dependabot branch (e.g. adapting our code to the version bump) leaves
+            // pr.user == dependabot[bot] yet carries semantic changes that MUST be
+            // reviewed. Discriminate on commit author.login (dependabot[bot] vs the
+            // human's login); degrade to reviewing on any lookup failure so real
+            // code is never silently skipped.
+            const isDependabot = (pr.user?.login || '') === 'dependabot[bot]';
+            let dependabotOnly = isDependabot;
+            if (isDependabot) {
+              try {
+                const commits = await github.paginate(github.rest.pulls.listCommits, {
+                  owner, repo, pull_number: pr.number, per_page: 100,
+                });
+                dependabotOnly = commits.length > 0 &&
+                  commits.every((c) => (c.author?.login || '') === 'dependabot[bot]');
+              } catch (e) {
+                core.info(`commit-author lookup failed (will review): ${e.message}`);
+                dependabotOnly = false;
+              }
+            }
+            // THIS REPO IS PUBLIC, so a PR from a fork gets neither the API key
+            // nor `id-token: write` — GitHub withholds both from a fork-triggered
+            // `pull_request` run. The model call therefore CANNOT run, and letting
+            // the job try would wedge every community PR behind a permanently red
+            // required check. Skip green instead; the reason is visible on the PR as the
+            // `ai-review-findings` status description ("Skipped (fork)"), so a
+            // maintainer can tell the review did not run rather than assuming it passed.
+            //
+            // This is also why the workflow must never be switched to
+            // `pull_request_target` to "fix" the reviewer not commenting on forks:
+            // that trigger runs untrusted code in the base context WITH the API key
+            // and a write-scoped token, handing an anonymous attacker both our
+            // model budget and repo write. The safe version of that fix is this
+            // skip. Fork PRs still get a human — the ruleset requires an approval.
+            //
+            // Checked before the size guard on purpose: an oversize fork PR should
+            // skip green rather than go red, since no review was ever possible and
+            // a red check would only block a PR a human must approve anyway.
+            const isFork = pr.head?.repo?.fork === true;
+            const skipReason = isFork ? 'fork' : modifiesSelf ? 'self_workflow' : dependabotOnly ? 'dependabot' : tooLarge ? 'too_large' : unchanged ? 'unchanged' : '';
+
+            core.info(`Reviewable changed lines (excl. generated): ${changed} (threshold ${MAX_CHANGED_LINES}); skipReason=${skipReason || 'none'}`);
+            core.setOutput('changed', String(changed));
+            core.setOutput('proceed', skipReason ? 'false' : 'true');
+            core.setOutput('files', reviewable.length ? reviewable.join('\n') : '(none — only generated/asset files changed)');
+            // Do NOT inline the diff into the prompt: the prompt becomes a single
+            // env var when the action step is spawned, and Linux caps one env
+            // string at MAX_ARG_STRLEN (128 KiB) — execve then fails with E2BIG
+            // ("Argument list too long") on dense diffs well under the 2000-LINE
+            // guard (lines are a poor proxy for bytes). Instead write the filtered
+            // diff to a file in the workspace and hand the model its absolute path;
+            // the Read tool (workspace-scoped) fetches it and the prompt stays
+            // small and bounded regardless of diff size. The run-id in the name
+            // keeps it unique even if a (future) self-hosted runner ever shares one
+            // workspace across concurrent jobs — on GitHub-hosted runners each job
+            // gets its own ephemeral VM, so the file is also auto-discarded at job
+            // end. It must live in the workspace tree (not $RUNNER_TEMP): Read is
+            // workspace-scoped with no --add-dir, so out-of-tree paths are unreadable.
+            const diffPath = `${process.env.GITHUB_WORKSPACE}/.claude-review-diff-${process.env.GITHUB_RUN_ID}.md`;
+            fs.writeFileSync(diffPath, diffBody);
+            core.setOutput('diff_path', diffPath);
+
+            if (!skipReason) return;
+
+            // too-large is the ONE skip that BLOCKS: post (or update in place) a
+            // single split-it notice and FAIL the job (red) so an oversize diff
+            // can't bypass review. No fingerprint — we didn't review, so the next
+            // push must not debounce against this.
+            if (skipReason === 'too_large') {
+              const MARKER = '<!-- ai-code-review:too-large -->';
+              const body = `${MARKER}\n🤖 **AI review could not run — diff too large to review well** (~${changed} changed lines of reviewable code; threshold ${MAX_CHANGED_LINES}). Large PRs dilute review quality for both the AI and human reviewers, so this **blocks merge** (the required \`ai-review-results\` check is red) until the PR is split into smaller, focused ones. _(Generated, vendored, and public-asset changes are excluded from this count.)_`;
+              const existing = await github.paginate(github.rest.issues.listComments, {
+                owner, repo, issue_number: pr.number, per_page: 100,
+              });
+              const prior = existing.find((c) => (c.body || '').includes(MARKER));
+              if (prior) {
+                await github.rest.issues.updateComment({ owner, repo, comment_id: prior.id, body });
+              } else {
+                await github.rest.issues.createComment({ owner, repo, issue_number: pr.number, body });
+              }
+              core.setFailed(`PR too large to auto-review (${changed} reviewable lines > ${MAX_CHANGED_LINES}) — split it.`);
+              return;
+            }
+
+            // fork / self_workflow / dependabot / unchanged carry nothing we can
+            // review. Leave
+            // the job GREEN (non-blocking) — the job's success IS the passing verdict
+            // — and record the diff fingerprint on the non-required
+            // `ai-review-findings` status so the next byte-identical push
+            // debounces. Non-required ⇒ its suite parentage never gates merge. The
+            // write is best-effort: a transient status-API failure must NOT fail this
+            // (a passing) job — the only cost of a missing fingerprint is that the
+            // next identical push reviews again (the debounce read fails open too).
+            try {
+              await github.rest.repos.createCommitStatus({
+                owner, repo, sha: pr.head.sha, context: 'ai-review-findings', state: 'success',
+                description: `Skipped (${skipReason}) · fp:${diffHash}`,
+              });
+            } catch (e) {
+              core.info(`fingerprint write failed (harmless — next push re-reviews): ${e.message}`);
+            }
+            core.info(`ai-review-results: skipped (${skipReason}) — verdict success (non-blocking).`);
+
+      - name: Load review instructions
+        id: instructions
+        if: steps.size.outputs.proceed == 'true'
+        # Inject the instructions into the prompt rather than have the model
+        # spend a turn Read-ing the file — cheaper and deterministic.
+        run: |
+          {
+            echo 'text<<__CLAUDE_REVIEW_EOF__'
+            cat .github/claude-review.md
+            echo '__CLAUDE_REVIEW_EOF__'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Gather dismissed findings
+        id: dismissed
+        if: steps.size.outputs.proceed == 'true'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            // Suppression: collect claude[bot] review threads the author has
+            // RESOLVED — an explicit "considered and rejected" signal. The model
+            // posts fresh inline comments every run, so without this a dismissed
+            // finding returns on the next push (the re-litigation the full-PR
+            // re-review would otherwise cause). We hand the model only the
+            // resolved-AND-still-current findings (see the isOutdated filter
+            // below) and the instructions tell it not to re-raise them.
+            // isResolved/isOutdated live only in GraphQL (the REST review-comment
+            // API exposes neither thread resolution nor outdatedness).
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const num = context.payload.pull_request.number;
+            const items = [];
+            let cursor = null;
+            for (;;) {
+              const data = await github.graphql(`
+                query($owner:String!,$repo:String!,$num:Int!,$cursor:String){
+                  repository(owner:$owner,name:$repo){
+                    pullRequest(number:$num){
+                      reviewThreads(first:100,after:$cursor){
+                        pageInfo{ hasNextPage endCursor }
+                        nodes{
+                          isResolved
+                          isOutdated
+                          comments(first:1){ nodes{ path body author{ login } } }
+                        }
+                      }
+                    }
+                  }
+                }`, { owner, repo, num, cursor });
+              const threads = data.repository.pullRequest.reviewThreads;
+              for (const t of threads.nodes) {
+                if (!t.isResolved) continue;
+                // Suppress ONLY while the code the finding is about is unchanged.
+                // GitHub flips a thread to `isOutdated` once the diff hunk it is
+                // anchored to changes — i.e. the author edited the very code the
+                // dismissed finding concerned. Drop those so the reviewer
+                // re-evaluates the changed code fresh instead of staying silent on
+                // a concern that the edit may have reintroduced or invalidated.
+                if (t.isOutdated) continue;
+                const c = t.comments.nodes[0];
+                if (!c) continue;
+                if (!(c.author?.login || '').toLowerCase().includes('claude')) continue;
+                const body = (c.body || '').replace(/\s+/g, ' ').trim().slice(0, 240);
+                items.push(`- [${c.path || '(file?)'}] ${body}`);
+              }
+              if (!threads.pageInfo.hasNextPage) break;
+              cursor = threads.pageInfo.endCursor;
+            }
+            core.info(`dismissed findings carried into prompt: ${items.length}`);
+            core.setOutput('text', items.length ? items.join('\n') : '(none)');
+
+      - name: Claude review
+        if: steps.size.outputs.proceed == 'true'
+        uses: anthropics/claude-code-action@9d7150bc8a3dae8149739a88019d192b579ad90c # v1
+        with:
+          anthropic_api_key: ${{ secrets.CODE_REVIEW_ANTHROPIC_API_KEY }}
+          # One comment, updated in place across pushes (needs claude[bot] auth,
+          # provided by the Claude GitHub App via the OIDC step above).
+          use_sticky_comment: true
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+
+            Review the changes in the reviewable diff (the file referenced in
+            <reviewable-diff-file> below), following the <review-instructions>
+            EXACTLY. Post each finding as an inline comment on the relevant line.
+            Post ONE summary as a TOP-LEVEL PR comment via `gh pr comment` — never
+            as an inline comment on a file line, and never as an approving or
+            CHANGES_REQUESTED review. If you have NO findings, post only that
+            top-level summary comment and add NO inline comments (an inline
+            comment opens a review thread that blocks merge under required
+            conversation resolution — a clean review must open none). You are
+            read-only and must not modify, commit, or push.
+
+            The reviewable diff is ALREADY filtered to the files listed below
+            (generated, vendored, and public-asset files are excluded) and has been
+            written to a file for you. Review ONLY these files — do NOT run
+            `gh pr diff` (it pulls the full, unfiltered diff and wastes your
+            turn/token budget); the only exception is a file marked "[diff omitted]"
+            inside that diff, which you may fetch individually. For file ACCESS use
+            the Read / Grep / Glob tools — bash `cat`/`grep`/`ls`/`find`/`sed` are
+            blocked and a denied call wastes a turn. Use `gh pr view` to read the
+            PR description (check for staged-landing intent), and Grep/Read to
+            verify cross-file facts before flagging.
+
+            START by reading the pre-filtered diff (this file IS your diff — read
+            it in full before anything else) with the Read tool:
+            <reviewable-diff-file>
+            ${{ steps.size.outputs.diff_path }}
+            </reviewable-diff-file>
+
+            Files in scope:
+            <files-in-scope>
+            ${{ steps.size.outputs.files }}
+            </files-in-scope>
+
+            Findings the author already reviewed and DISMISSED (resolved the
+            thread) in an earlier round. Do NOT re-raise these — see the
+            "Previously dismissed findings" rule in the instructions:
+            <previously-dismissed-findings>
+            ${{ steps.dismissed.outputs.text }}
+            </previously-dismissed-findings>
+
+            <review-instructions>
+            ${{ steps.instructions.outputs.text }}
+            </review-instructions>
+          # Read-and-comment-only toolset (layer 2 of the lock; layer 1 is the
+          # pull_request-only trigger, layer 3 is contents: read above). Grep /
+          # Glob / Read are workspace-scoped repo search, to VERIFY cross-file
+          # findings (a helper actually scrubbing/sorting, all callers of a changed
+          # signature, an existing helper being reinvented) before flagging.
+          # Edit / Write / git push are absent here and explicitly denied below.
+          claude_args: |
+            --model claude-sonnet-4-6
+            --max-turns 40
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Grep,Glob,Read"
+            --disallowedTools "Edit,Write,Bash(git push:*),Bash(git commit:*)"
+
+      - name: Record review fingerprint
+        # Runs only when a review actually ran and succeeded. Counts the claude[bot]
+        # inline findings on this commit by severity tag and records them (with the
+        # diff fingerprint) on the non-required `ai-review-findings` status. The
+        # job's own success is the passing verdict — findings never turn it red (see
+        # the file header).
+        if: ${{ success() && steps.size.outputs.proceed == 'true' }}
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const pr = context.payload.pull_request;
+            const sha = pr.head.sha;
+            // Fingerprint of the diff we just reviewed — stored on the verdict so
+            // the next push can debounce an identical re-review against it.
+            const diffHash = ${{ toJSON(steps.size.outputs.diff_hash) }};
+
+            // claude[bot]: the Claude GitHub App bot id, or any Bot login
+            // containing "claude" (matches the action's own detection).
+            const CLAUDE_APP_BOT_ID = 209825114;
+            const isClaude = (u) =>
+              !!u && (u.id === CLAUDE_APP_BOT_ID ||
+                (u.type === 'Bot' && (u.login || '').toLowerCase().includes('claude')));
+
+            // The job's success IS the passing verdict — the review already ran and
+            // succeeded by the time this step fires. Counting findings and writing
+            // the fingerprint status are BEST-EFFORT decoration/debounce: a transient
+            // API failure here must NOT turn a completed review RED, so the whole
+            // block is caught and swallowed (a missing fingerprint just re-reviews on
+            // the next identical push; the debounce read fails open too).
+            try {
+              const comments = await github.paginate(github.rest.pulls.listReviewComments, {
+                owner, repo, pull_number: pr.number, per_page: 100,
+              });
+              const counts = { blocker: 0, high: 0, nit: 0 };
+              let claudeComments = 0;
+              for (const c of comments) {
+                if (!isClaude(c.user)) continue;
+                if (c.commit_id !== sha) continue; // only this run's findings
+                claudeComments++;
+                const m = /\*\*(blocker|high|nit)\*\*/i.exec(c.body || '');
+                if (m) {
+                  const sev = m[1].toLowerCase();
+                  counts[sev] = (counts[sev] ?? 0) + 1;
+                }
+              }
+
+              const total = counts.blocker + counts.high + counts.nit;
+              const plural = (n, w) => `${n} ${w}${n === 1 ? '' : 's'}`;
+              let title;
+              // No "(advisory)" suffix: this text rides the row next to the REQUIRED
+              // ai-review-results gate, and inline findings DO block via conversation
+              // resolution — calling them advisory over-claims non-blocking-ness.
+              if (total > 0) {
+                const parts = [];
+                if (counts.blocker) parts.push(plural(counts.blocker, 'blocker'));
+                if (counts.high) parts.push(`${counts.high} high`);
+                if (counts.nit) parts.push(plural(counts.nit, 'nit'));
+                title = `${counts.blocker ? '⚠️ ' : ''}${parts.join(' · ')}`;
+              } else if (claudeComments > 0) {
+                // Comments exist but no severity tag parsed — don't claim "clean".
+                title = plural(claudeComments, 'comment');
+              } else {
+                title = 'No issues found';
+              }
+
+              const desc = `${title.slice(0, 60)} · fp:${diffHash}`;
+              await github.rest.repos.createCommitStatus({
+                owner, repo, sha, context: 'ai-review-findings', state: 'success', description: desc,
+              });
+            } catch (e) {
+              core.info(`fingerprint/count write failed (harmless — review still succeeded): ${e.message}`);
+            }

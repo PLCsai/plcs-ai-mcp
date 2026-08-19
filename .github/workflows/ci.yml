@@ -1,0 +1,107 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+# Each job surfaces as its own required status check (per-control evidence).
+# The main branch ruleset keys required checks to these job NAMES — renaming a
+# job without updating the ruleset would block all merges.
+#
+# This repo holds no application code: a README and the MCP registry manifest.
+# There is deliberately no typecheck/lint/build/unit_tests job — with nothing to
+# compile there would be nothing to run, and a required check that passes without
+# doing anything is worse than no check, because it reads as coverage.
+env:
+  NODE_VERSION: '22'
+
+jobs:
+  # server.json is what the MCP registry ingests. A violation here does not break
+  # a build — it breaks the public listing, and only once someone tries to
+  # publish. This repo has already hit exactly that: commit d7f5964,
+  # "fix: registry description limit (100 chars)".
+  #
+  # The schema is fetched from the URL the file itself declares in `$schema`, not
+  # a hardcoded one, so bumping to a newer dated schema needs no workflow change
+  # and can never validate against a version the file is not claiming.
+  validate_server_json:
+    name: validate_server_json
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Parse server.json and read its declared schema
+        id: schema
+        run: |
+          set -euo pipefail
+          if ! node -e 'JSON.parse(require("fs").readFileSync("server.json","utf8"))'; then
+            echo "::error file=server.json::server.json is not valid JSON."
+            exit 1
+          fi
+          url=$(node -p 'JSON.parse(require("fs").readFileSync("server.json","utf8"))["$schema"] || ""')
+          if [ -z "$url" ]; then
+            echo "::error file=server.json::server.json has no \$schema field, so there is nothing to validate it against. Add one."
+            exit 1
+          fi
+          case "$url" in
+            https://static.modelcontextprotocol.io/schemas/*) ;;
+            *)
+              echo "::error file=server.json::\$schema must be an official modelcontextprotocol.io schema URL; got '$url'."
+              exit 1 ;;
+          esac
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "Validating against $url"
+
+      # Network failure and schema violation must not look the same. This step
+      # only fetches; the next one only validates.
+      - name: Fetch the schema
+        run: |
+          set -euo pipefail
+          if ! curl -sSfL --retry 3 --retry-delay 2 --max-time 30 \
+               -o /tmp/server.schema.json "${{ steps.schema.outputs.url }}"; then
+            echo "::error::Could not fetch the schema from ${{ steps.schema.outputs.url }} — this is a network/availability failure, not a problem with server.json."
+            exit 1
+          fi
+          node -e 'JSON.parse(require("fs").readFileSync("/tmp/server.schema.json","utf8"))'
+
+      # --strict=false: the published schema uses the `example` annotation, which
+      # ajv's strict mode rejects as an unknown keyword. That is a property of
+      # their schema, not of our file.
+      - name: Validate server.json against the schema
+        run: npx --yes ajv-cli@5.0.0 validate --strict=false -s /tmp/server.schema.json -d server.json
+
+  secret_scan:
+    name: secret_scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # This repo is PUBLIC, so a committed credential is exposed the moment it
+      # lands — there is no window to catch it later.
+      #
+      # Scan the CURRENT tracked tree (HEAD, .git excluded), not git history.
+      # --results=verified reports/fails only on API-confirmed-live secrets, so
+      # the `plck_live_…` placeholders in README.md pass by design while a real
+      # key fails the gate. A verified hit is a rotate-at-provider incident, not
+      # a delete-from-tree fix.
+      - name: Export current tracked tree (HEAD, no history)
+        run: |
+          mkdir -p "$RUNNER_TEMP/scan"
+          git archive HEAD | tar -x -C "$RUNNER_TEMP/scan"
+      - name: TruffleHog filesystem scan (verified-only)
+        run: |
+          docker run --rm -v "$RUNNER_TEMP/scan:/scan:ro" \
+            ghcr.io/trufflesecurity/trufflehog:3.96.0 \
+            filesystem /scan --results=verified --fail --no-update
