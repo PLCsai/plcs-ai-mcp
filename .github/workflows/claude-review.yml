@@ -412,7 +412,7 @@ jobs:
 
       - name: Claude review
         if: steps.size.outputs.proceed == 'true'
-        uses: anthropics/claude-code-action@9d7150bc8a3dae8149739a88019d192b579ad90c # v1
+        uses: anthropics/claude-code-action@a874e9ecd7bb36efdad65429c6b35815f5a08f10 # v1
         with:
           anthropic_api_key: ${{ secrets.CODE_REVIEW_ANTHROPIC_API_KEY }}
           # One comment, updated in place across pushes (needs claude[bot] auth,
