@@ -2,8 +2,8 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "ai.plcs/plcs-ai",
   "title": "PLCs.ai",
-  "description": "Query Allen-Bradley and Siemens PLC projects, live tag values, and analyses in plain English.",
-  "version": "1.0.0",
+  "description": "Query Allen-Bradley, Siemens and CODESYS V3 PLC projects, live tags and analyses in plain English.",
+  "version": "1.0.1",
   "websiteUrl": "https://www.plcs.ai/developer/mcp",
   "repository": {
     "url": "https://github.com/PLCsai/plcs-ai-mcp",
