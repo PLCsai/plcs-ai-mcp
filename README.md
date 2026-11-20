@@ -39,17 +39,16 @@ See per-client guides: https://www.plcs.ai/developer/mcp — covers Cursor, Code
 
 ## What the agent can do
 
-17 tools, permission-scoped per API key or OAuth grant:
+18 tools, permission-scoped per API key or OAuth grant:
 
 | Area | Tools |
 |---|---|
 | Discover | `plcs_health`, `plcs_list_projects`, `plcs_get_project`, `plcs_get_project_source` |
 | Ask | `plcs_ask_project` — a cited answer from the PLCs.ai assistant, not raw source to reason over |
-| Live plant data | `plcs_get_live_values`, `plcs_get_tag_history`, `plcs_request_live_tags` |
-| Analyze | `plcs_get_project_analysis` (dead code, race conditions, missing handshakes, interlock audits, cycle-time bottlenecks, signal tracing) |
+| Live plant data | `plcs_get_live_values`, `plcs_get_tag_history`, `plcs_request_live_tags`, `plcs_get_window_series` (an observation window's samples at its own rate) |
+| Analyze | `plcs_get_project_analysis` (dead code, race conditions, missing handshakes, interlock audits, cycle-time bottlenecks, signal tracing), `plcs_get_project_devices` (the project's full device inventory, paged) |
 | Propose | `plcs_propose_code` — a plan you approve, then a **reviewable proposal**; nothing is saved without review |
 | Version & export | `plcs_save_version`, `plcs_stage_upload`, `plcs_export_plc`, `plcs_export_pdf`, `plcs_get_export`, `plcs_download_export` |
-| Embed | `plcs_mint_embed_token` — short-lived, read-only, project-scoped iframe tokens |
 
 The agent reasons over projects your organization **already owns**. Onboarding a
 machine is a deliberate act in the app or through a version-source connector, so
