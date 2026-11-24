@@ -64,7 +64,7 @@ versions, but never add a project.
 ## Requirements
 
 - A PLCs.ai account ([start a free trial](https://www.plcs.ai))
-- For the `mcp-remote` bridge: Node 18+
+- For clients set up through the [`mcp-remote`](https://www.npmjs.com/package/mcp-remote) bridge (see the per-client guides): Node 18+
 
 ---
 
