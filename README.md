@@ -4,7 +4,7 @@ Connect Claude, Cursor, Codex, or any MCP-compatible agent to your PLC projects.
 
 [PLCs.ai](https://www.plcs.ai) is the AI platform purpose-built for PLC engineers: upload an Allen-Bradley (Studio 5000), Siemens (TIA Portal) or CODESYS V3 project and understand, troubleshoot, document, and safely generate code for it in plain English. This MCP server gives any AI agent governed access to that same capability — your projects, live tag values, and analyses — with per-tool permission scopes.
 
-**Remote server:** `https://mcp.plcs.ai/mcp` (Streamable HTTP · OAuth or API key)
+**Remote server:** `https://mcp.plcs.ai/mcp` (Streamable HTTP · OAuth)
 **Full documentation:** https://www.plcs.ai/developer/mcp
 
 ## Quick start
@@ -15,31 +15,23 @@ Connect Claude, Cursor, Codex, or any MCP-compatible agent to your PLC projects.
 claude mcp add --transport http plcs-ai https://mcp.plcs.ai/mcp
 ```
 
-Then run `/mcp` and choose **Authenticate** to sign in with your PLCs.ai account. (Or pass an API key: `--header "Authorization: Bearer plck_live_…"`.)
+Then run `/mcp` and choose **Authenticate** to sign in with your PLCs.ai account.
 
 ### Claude Desktop
 
-Settings → Connectors → Add custom connector → URL `https://mcp.plcs.ai/mcp` → Connect and sign in. For API-key or on-prem setups, use the [`mcp-remote`](https://www.npmjs.com/package/mcp-remote) bridge:
-
-```json
-{
-  "mcpServers": {
-    "plcs-ai": {
-      "command": "npx",
-      "args": ["-y", "mcp-remote", "https://mcp.plcs.ai/mcp",
-               "--header", "Authorization: Bearer plck_live_…"]
-    }
-  }
-}
-```
+Settings → Connectors → Add custom connector → URL `https://mcp.plcs.ai/mcp` → Connect and sign in. For an on-prem appliance, see the setup guide: https://www.plcs.ai/developer/mcp
 
 ### Cursor / Codex / other MCP clients
 
 See per-client guides: https://www.plcs.ai/developer/mcp — covers Cursor, Codex, and any client that speaks remote MCP or can run `mcp-remote`.
 
+### Headless and automation
+
+MCP signs in with OAuth only; it does not accept API keys. For scripts, CI and other headless use, call the [REST API](https://www.plcs.ai/developer) (`/api/v1`) with a `plck_` API key instead.
+
 ## What the agent can do
 
-18 tools, permission-scoped per API key or OAuth grant:
+18 tools, permission-scoped per OAuth grant:
 
 | Area | Tools |
 |---|---|
@@ -71,7 +63,7 @@ versions, but never add a project.
 
 ## Requirements
 
-- A PLCs.ai account ([start a free trial](https://www.plcs.ai)) or API key
+- A PLCs.ai account ([start a free trial](https://www.plcs.ai))
 - For the `mcp-remote` bridge: Node 18+
 
 ---
