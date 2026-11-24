@@ -93,8 +93,8 @@ jobs:
       #
       # Scan the CURRENT tracked tree (HEAD, .git excluded), not git history.
       # --results=verified reports/fails only on API-confirmed-live secrets, so
-      # the `plck_live_…` placeholders in README.md pass by design while a real
-      # key fails the gate. A verified hit is a rotate-at-provider incident, not
+      # placeholder keys in docs pass by design while a real key fails the
+      # gate. A verified hit is a rotate-at-provider incident, not
       # a delete-from-tree fix.
       - name: Export current tracked tree (HEAD, no history)
         run: |

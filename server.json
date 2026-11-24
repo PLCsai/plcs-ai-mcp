@@ -3,8 +3,15 @@
   "name": "ai.plcs/plcs-ai",
   "title": "PLCs.ai",
   "description": "Query Allen-Bradley, Siemens and CODESYS V3 PLC projects, live tags and analyses in plain English.",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "websiteUrl": "https://www.plcs.ai/developer/mcp",
+  "icons": [
+    {
+      "src": "https://www.plcs.ai/og-icon.png",
+      "mimeType": "image/png",
+      "sizes": ["1000x1000"]
+    }
+  ],
   "repository": {
     "url": "https://github.com/PLCsai/plcs-ai-mcp",
     "source": "github"
