@@ -27,7 +27,7 @@ See per-client guides: https://www.plcs.ai/developer/mcp — covers Cursor, Code
 
 ### Headless and automation
 
-MCP signs in with OAuth only; it does not accept API keys. For scripts, CI and other headless use, call the [REST API](https://www.plcs.ai/developer) (`/api/v1`) with a `plck_` API key instead.
+For scripts, servers, and other headless automation, use the [REST API](https://www.plcs.ai/developer) (`/api/v1`) with a `plck_` API key.
 
 ## What the agent can do
 
